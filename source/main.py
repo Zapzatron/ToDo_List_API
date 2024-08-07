@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from source.schemas import schemas
 from source.crud import user_account, user_tasks
-from typing import List
 import source.database as database
+from typing import List
 from contextlib import asynccontextmanager
 import uvicorn
 import os
@@ -45,14 +46,14 @@ async def custom_http_exception_handler(request: Request, exc: CustomHTTPExcepti
 
 @app.post("/users/create", response_model=schemas.User)
 async def create_user(user: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
-    db_user = await user_account.get_user_by_username(db, username=user.username)
-
-    if db_user:
-        error_code = 403
-        error_json = {"error": {"message": f"Имя '{user.username}' уже зарегистрировано", "code": error_code}}
-        return JSONResponse(error_json, error_code)
-
-    return await user_account.create_user(db=db, user=user)
+    try:
+        return await user_account.create_user(db=db, user=user)
+    except IntegrityError as e:
+        if "повторяющееся значение" in str(e):
+            error_code = 403
+            error_json = {"error": {"message": f"Имя '{user.username}' уже зарегистрировано", "code": error_code}}
+            return JSONResponse(error_json, error_code)
+        raise e
 
 
 async def check_user_auth_with_raise(db, user):
@@ -65,27 +66,55 @@ async def check_user_auth_with_raise(db, user):
     return check_user
 
 
-@app.post("/tasks/check_auth")
-async def check_auth(user: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
-    await check_user_auth_with_raise(db, user)
-    return {"status": "success"}
+@app.post("/users/get_token", response_model=schemas.Token)
+async def login_for_access_token(user: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
+    user = await check_user_auth_with_raise(db, user)
+
+    token_json = user_account.create_access_token({"username": user.username})
+
+    return token_json
+
+
+async def check_user_token_auth_with_raise(db, token):
+    check_user = await user_account.check_user_token_auth(db, token)
+
+    if not check_user:
+        error_code = 403
+        error_json = {"error": {"message": "Проверка токена пользователя не пройдена", "code": error_code}}
+        raise CustomHTTPException(error_code, error_json)
+    return check_user
+
+
+@app.post("/users/check_token_auth", response_model=schemas.MoreUserInfo)
+async def check_auth(token: str, db: AsyncSession = Depends(get_db)):
+    return await check_user_token_auth_with_raise(db, token)
 
 
 @app.post("/tasks/create", response_model=schemas.Task)
-async def create_task(task_user: schemas.TaskUserCreate, db: AsyncSession = Depends(get_db)):
-    user = task_user.user
-    task = task_user.task
+async def create_task(task: schemas.TaskCreate, db: AsyncSession = Depends(get_db),
+                      user=Depends(check_auth)):
+    db_task = await user_tasks.create_task_with_permissions(db=db, task=task)
 
-    await check_user_auth_with_raise(db, user)
+    # print(db_task)
 
-    db_task = await user_tasks.create_task(db=db, task=task)
     return db_task
 
 
-@app.post("/tasks/read/{task_id}", response_model=schemas.Task)
-async def read_task(user: schemas.UserCreate, task_id: int, db: AsyncSession = Depends(get_db)):
-    user = await check_user_auth_with_raise(db, user)
+@app.post("/tasks/update_permissions/{task_id}", response_model=schemas.TaskPermission)
+async def update_task_permissions(task_permission_data: schemas.TaskPermissionUpdate, task_id: int,
+                                  db: AsyncSession = Depends(get_db), token_check=Depends(check_auth)):
+    user_id = task_permission_data.user_id
+    can_read = task_permission_data.can_read
+    can_update = task_permission_data.can_update
 
+    task_permissions = await user_tasks.update_task_permissions(db, task_id, user_id,
+                                                                can_read=can_read, can_update=can_update)
+
+    return task_permissions
+
+
+@app.post("/tasks/read/{task_id}", response_model=schemas.Task)
+async def read_task(task_id: int, db: AsyncSession = Depends(get_db), user=Depends(check_auth)):
     if not await user_tasks.check_read_permission(db, task_id, user.id):
         error_code = 403
         error_json = {"error": {"message": f"Не достаточно прав для чтения задачи '{task_id}'", "code": error_code}}
@@ -102,19 +131,16 @@ async def read_task(user: schemas.UserCreate, task_id: int, db: AsyncSession = D
 
 
 @app.post("/tasks/read_tasks", response_model=List[schemas.Task])
-async def read_tasks(user: schemas.UserCreate, skip: int = 0, limit: int = 10, db: AsyncSession = Depends(get_db)):
-    await check_user_auth_with_raise(db, user)
-
-    tasks = await user_tasks.get_tasks_by_username(db, user.username, skip=skip, limit=limit)
+async def read_tasks(read_task_params: schemas.ReadTaskParams = schemas.ReadTaskParams(),
+                     db: AsyncSession = Depends(get_db), user=Depends(check_auth)):
+    tasks = await user_tasks.get_tasks_by_user_id(db, user.id, skip=read_task_params.skip, limit=read_task_params.limit)
 
     return tasks
 
 
 @app.post("/tasks/update/{task_id}", response_model=schemas.Task)
-async def update_task(user: schemas.UserCreate, task_id: int, task: schemas.TaskBase,
-                      db: AsyncSession = Depends(get_db)):
-    user = await check_user_auth_with_raise(db, user)
-
+async def update_task(task_id: int, task: schemas.TaskBase,
+                      db: AsyncSession = Depends(get_db), user=Depends(check_auth)):
     if not await user_tasks.check_update_permission(db, task_id, user.id):
         error_code = 403
         error_json = {"error": {"message": f"Не достаточно прав для обновления задачи '{task_id}'", "code": error_code}}
@@ -131,9 +157,7 @@ async def update_task(user: schemas.UserCreate, task_id: int, task: schemas.Task
 
 
 @app.post("/tasks/delete/{task_id}")
-async def delete_task(user: schemas.UserCreate, task_id: int, db: AsyncSession = Depends(get_db)):
-    await check_user_auth_with_raise(db, user)
-
+async def delete_task(task_id: int, db: AsyncSession = Depends(get_db), user=Depends(check_auth)):
     db_task = await user_tasks.delete_task(db=db, task_id=task_id)
 
     if not db_task:
@@ -142,23 +166,6 @@ async def delete_task(user: schemas.UserCreate, task_id: int, db: AsyncSession =
         raise CustomHTTPException(error_code, error_json)
 
     return {"status": "success"}
-
-
-@app.post("/tasks/update_permissions/{task_id}", response_model=schemas.TaskPermission)
-async def update_task_permissions(task_permission_data: schemas.TaskPermissionUpdate, task_id: int,
-                                  db: AsyncSession = Depends(get_db)):
-    user = task_permission_data.user
-
-    await check_user_auth_with_raise(db, user)
-
-    granted_user_id = task_permission_data.granted_user_id
-    can_read = task_permission_data.can_read
-    can_update = task_permission_data.can_update
-
-    task_permissions = await user_tasks.update_task_permissions(db, task_id, granted_user_id,
-                                                                can_read=can_read, can_update=can_update)
-
-    return task_permissions
 
 
 if __name__ == "__main__":

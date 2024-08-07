@@ -3,7 +3,7 @@ from pydantic import BaseModel, ConfigDict
 
 class TaskPermission(BaseModel):
     task_id: int
-    granted_user_id: int
+    user_id: int
     can_read: bool
     can_update: bool
     model_config = ConfigDict(from_attributes=True)
@@ -24,6 +24,16 @@ class Task(TaskBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ReadTaskParams(BaseModel):
+    skip: int = 0
+    limit: int = 10
+
+
+class Token(BaseModel):
+    access_token: str
+    expire_minutes: int
+
+
 class UserBase(BaseModel):
     username: str
 
@@ -37,13 +47,17 @@ class User(UserBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class MoreUserInfo(User):
+    tasks: list[Task]
+    permissions: list[TaskPermission]
+
+
 class TaskUserCreate(BaseModel):
     user: UserCreate
     task: TaskCreate
 
 
 class TaskPermissionUpdate(BaseModel):
-    user: UserCreate
-    granted_user_id: int
+    user_id: int
     can_read: bool | None = None
     can_update: bool | None = None

@@ -15,8 +15,9 @@ config.DB_USERNAME = "pytestuser1"
 config.DB_PASSWORD = "123456"
 
 from source.database import create_all_tables, drop_all_tables, get_db
+from source.models import models
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy.future import select
 import pytest_asyncio
 import asyncio
 import warnings
@@ -60,12 +61,12 @@ async def client():
 
 
 @pytest_asyncio.fixture
-async def db_session():
+async def db():
     async for session in get_db():
         yield session
 
 
-TEST_USERNAME = "testuser"
+TEST_USERNAME = "testuser1"
 TEST_PASSWORD = "testpass"
 TEST_TASK_TITLE = "Test Task"
 TEST_TASK_DESCRIPTION = "Test Description"
@@ -74,20 +75,22 @@ TEST_TASK_DESCRIPTION = "Test Description"
 async def create_user(client, username=TEST_USERNAME, password=TEST_PASSWORD, status_code=200):
     response = await client.post("/users/create", json={"username": username, "password": password})
 
+    response_json = response.json()
+
     assert response.status_code == status_code
+
     if status_code == 200:
-        assert response.json()["username"] == username
-    return response
+        assert response_json["username"] == username
+
+    return response_json
 
 
 @pytest.mark.asyncio
-async def test_create_user(client, db_session: AsyncSession):
+async def test_create_user(client, db: AsyncSession):
     await create_user(client)
 
-    # Проверка, что пользователь был сохранен в базе данных
-    result = await db_session.execute(text("SELECT * FROM users WHERE username = :username"),
-                                      {"username": TEST_USERNAME})
-    user = result.first()
+    result = await db.execute(select(models.User).filter(models.User.username == TEST_USERNAME))
+    user = result.scalars().first()
 
     assert user is not None
     assert user.username == TEST_USERNAME
@@ -95,201 +98,240 @@ async def test_create_user(client, db_session: AsyncSession):
     await create_user(client, status_code=403)
 
 
-@pytest.mark.asyncio
-async def test_check_user_auth(client, db_session: AsyncSession):
-    await create_user(client)
+async def get_auth_token(client, username: str, password: str):
+    response = await client.post("/users/get_token", json={"username": username,
+                                                           "password": password})
 
-    response = await client.post("/tasks/check_auth", json={"username": TEST_USERNAME,
-                                                            "password": TEST_PASSWORD})
+    response_json = response.json()
+    # print(response_json)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "success"
 
-    response = await client.post("/tasks/check_auth", json={"username": "some nonexistent name",
-                                                            "password": TEST_PASSWORD})
+    return response_json
+
+
+@pytest.mark.asyncio
+async def test_check_user_token_auth(client, db: AsyncSession):
+    await create_user(client, TEST_USERNAME, TEST_PASSWORD)
+
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
+
+    response = await client.post(f"/users/check_token_auth?token={response_json['access_token']}")
+
+    response_json = response.json()
+    # print(response.json())
+
+    assert response.status_code == 200
+    assert response_json["username"] == TEST_USERNAME
+
+    response = await client.post("/users/check_token_auth?token=some.random.token")
+
+    # print(response.json())
 
     assert response.status_code == 403
 
-    response = await client.post("/tasks/check_auth", json={"username": TEST_USERNAME,
-                                                            "password": "some wrong password"})
 
-    assert response.status_code == 403
-
-
-async def create_task(client, username=TEST_USERNAME, password=TEST_PASSWORD,
-                      title=TEST_TASK_TITLE, description=TEST_TASK_DESCRIPTION, need_create_user=True, session=None):
-    """
-    Если need_create_user=False, то session не должен быть None
-    """
-    if need_create_user:
-        response = await create_user(client, username, password)
-
-        user_id = response.json()["id"]
-    else:
-        result = await session.execute(text("SELECT id FROM users WHERE username = :username"),
-                                       {"username": username})
-        user_id = result.first().id
-
+async def create_task(client, token: str, title: str, description: str, owner_id: int):
     json_data = {
-        "user": {
-            "username": username,
-            "password": password
-        },
-        "task": {
-            "title": title,
-            "description": description,
-            "owner_id": user_id
-        }
+        "title": title,
+        "description": description,
+        "owner_id": owner_id,
     }
-    response = await client.post("/tasks/create", json=json_data)
+    response = await client.post(f"/tasks/create?token={token}", json=json_data)
+
+    response_json = response.json()
+    # print(response_json)
 
     assert response.status_code == 200
-    assert response.json()["title"] == title
-    return response
+    assert response.json()["title"] == TEST_TASK_TITLE
+    return response_json
 
 
 @pytest.mark.asyncio
-async def test_create_task(client, db_session: AsyncSession):
-    await create_task(client)
+async def test_create_task(client, db: AsyncSession):
+    user_json = await create_user(client, TEST_USERNAME, TEST_PASSWORD)
 
-    result = await db_session.execute(text("SELECT * FROM tasks WHERE title = :title"),
-                                      {"title": TEST_TASK_TITLE})
-    task = result.first()
+    user_id = user_json["id"]
+
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
+
+    await create_task(client, response_json['access_token'], TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, user_id)
+
+    result = await db.execute(select(models.Task).filter(models.Task.title == TEST_TASK_TITLE))
+    task = result.scalars().first()
+
+    # print(task)
 
     assert task is not None
     assert task.title == TEST_TASK_TITLE
 
 
-async def update_task_permissions(client, owner_username=TEST_USERNAME, owner_password=TEST_PASSWORD,
-                                  need_create_owner_user=True, session=None,
-                                  granted_username="some username", granted_password="123456",
-                                  can_read=None, can_update=None,
-                                  need_create_granted_user=True):
-    response = await create_task(client, owner_username, owner_password,
-                                 need_create_user=need_create_owner_user, session=session)
-    task_json = response.json()
-
-    if need_create_granted_user:
-        response = await create_user(client, granted_username, granted_password)
-
-        user_id = response.json()["id"]
-    else:
-        result = await session.execute(text("SELECT id FROM users WHERE username = :username"),
-                                       {"username": granted_username})
-        user_id = result.first().id
-
+async def update_task_permissions(client, token: str, user_id: int, task_id: int,
+                                  can_read: bool = None, can_update: bool = None, status_code=200):
     json_data = {
-        "user": {
-            "username": TEST_USERNAME,
-            "password": TEST_PASSWORD
-        },
-        "granted_user_id": user_id,
+        "user_id": user_id,
         "can_read": can_read,
         "can_update": can_update
     }
 
-    response = await client.post(f"/tasks/update_permissions/{task_json['id']}", json=json_data)
+    response = await client.post(f"/tasks/update_permissions/{task_id}?token={token}", json=json_data)
 
     update_task_permissions_json = response.json()
 
     # print(update_task_permissions_json)
 
-    assert response.status_code == 200
+    assert response.status_code == status_code
 
-    if not (can_read is None):
-        assert update_task_permissions_json["can_read"] == json_data["can_read"]
+    if status_code == 200:
+        if not (can_read is None):
+            assert update_task_permissions_json["can_read"] == json_data["can_read"]
 
-    if not (can_update is None):
-        assert update_task_permissions_json["can_update"] == json_data["can_update"]
-
-    return task_json
-
-
-@pytest.mark.asyncio
-async def test_update_task_permissions(client, db_session: AsyncSession):
-    await update_task_permissions(client, session=db_session, can_read=True, can_update=True)
+        if not (can_update is None):
+            assert update_task_permissions_json["can_update"] == json_data["can_update"]
 
 
 @pytest.mark.asyncio
-async def test_read_task(client, db_session: AsyncSession):
-    json_data = {
-        "username": "some username",
-        "password": "123456"
-        # "username": TEST_USERNAME,
-        # "password": TEST_PASSWORD
-    }
+async def test_update_task_permissions(client, db: AsyncSession):
+    owner_json = await create_user(client, TEST_USERNAME, TEST_PASSWORD)
 
-    task_json = await update_task_permissions(client, session=db_session,
-                                              granted_username="some username", granted_password="123456",
-                                              can_read=True)
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
 
-    response = await client.post(f"/tasks/read/{task_json['id']}", json=json_data)
+    token = response_json['access_token']
+
+    task_json = await create_task(client, token, TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, owner_json["id"])
+
+    user_json = await create_user(client, "testuser2", "testpass")
+
+    await update_task_permissions(client, token, user_json["id"], task_json["id"], can_read=True, can_update=True)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_task_permission(client, db: AsyncSession):
+    owner_json = await create_user(client, TEST_USERNAME, TEST_PASSWORD)
+
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
+
+    token = response_json['access_token']
+
+    task_json = await create_task(client, token, TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, owner_json["id"])
+
+    user_json = await create_user(client, "testuser2", "testpass")
+
+    await update_task_permissions(client, token, user_json["id"], task_json["id"], can_read=True, can_update=True)
+
+    await update_task_permissions(client, token, user_json["id"], task_json["id"], can_read=True, can_update=True)
+
+
+async def read_task(client, token: str, task_id: int, status_code=200):
+    response = await client.post(f"/tasks/read/{task_id}?token={token}")
 
     read_task_json = response.json()
 
     # print(read_task_json)
 
-    assert response.status_code == 200
-    assert read_task_json["id"] == task_json['id']
+    assert response.status_code == status_code
 
-    task_json = await update_task_permissions(client, need_create_owner_user=False, session=db_session,
-                                              need_create_granted_user=False, can_read=False)
-
-    response = await client.post(f"/tasks/read/{task_json['id']}", json=json_data)
-
-    # print(response.json())
-
-    assert response.status_code == 403
-
-    response = await client.post(f"/tasks/read/{123456}", json=json_data)
-
-    # print(response.json())
-
-    assert response.status_code == 403
+    if status_code == 200:
+        assert read_task_json["id"] == task_id
+    return read_task_json
 
 
 @pytest.mark.asyncio
-async def test_read_tasks(client, db_session: AsyncSession):
-    await create_task(client)
+async def test_read_task(client, db: AsyncSession):
+    owner_json = await create_user(client, TEST_USERNAME, TEST_PASSWORD)
 
-    for i in range(4):
-        await create_task(client, need_create_user=False, session=db_session)
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
 
-    await create_task(client, "some username")
+    owner_token = response_json['access_token']
 
-    for i in range(4):
-        await create_task(client, "some username", need_create_user=False, session=db_session)
+    task_json = await create_task(client, owner_token, TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, owner_json["id"])
 
+    user_json = await create_user(client, "testuser2", "testpass")
+
+    response_json = await get_auth_token(client, "testuser2", "testpass")
+
+    user_token = response_json['access_token']
+
+    await update_task_permissions(client, owner_token, user_json["id"], task_json["id"], can_read=True)
+
+    await read_task(client, user_token, task_json["id"])
+
+    await update_task_permissions(client, owner_token, user_json["id"], task_json["id"], can_read=False)
+
+    await read_task(client, user_token, task_json["id"], 403)
+
+    await read_task(client, user_token, 123456, 403)
+
+
+@pytest.mark.asyncio
+async def test_read_tasks(client, db: AsyncSession):
+    owner_json = await create_user(client, TEST_USERNAME, TEST_PASSWORD)
+
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
+
+    owner_token = response_json['access_token']
+
+    owner_task_json = await create_task(client, owner_token, TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, owner_json["id"])
+
+    user_json = await create_user(client, "testuser2", "testpass")
+
+    response_json = await get_auth_token(client, "testuser2", "testpass")
+
+    user_token = response_json['access_token']
+
+    for i in range(5):
+        await create_task(client, user_token, TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, user_json["id"])
+
+    await update_task_permissions(client, owner_token, user_json["id"], owner_task_json["id"], can_read=True)
+
+    skip_task_number = 0
     received_task_number_limit = 10
-    response = await client.post("/tasks/read_tasks", json={"username": TEST_USERNAME,
-                                                            "password": TEST_PASSWORD,
-                                                            "skip": 0,
-                                                            "limit": received_task_number_limit})
+
+    response = await client.post(f"/tasks/read_tasks?token={owner_token}",
+                                 json={"skip": skip_task_number, "limit": received_task_number_limit})
+
+    response_json = response.json()
+    # print(len(response_json), response_json)
 
     assert response.status_code == 200
+    assert len(response_json) == 1
+    assert len(response_json) <= received_task_number_limit
+
+    response = await client.post(f"/tasks/read_tasks?token={user_token}",
+                                 json={"skip": skip_task_number, "limit": received_task_number_limit})
+
+    response_json = response.json()
+    # print(len(response_json), response_json)
+
+    assert response.status_code == 200
+    assert len(response_json) == 6
     assert len(response.json()) <= received_task_number_limit
 
 
 @pytest.mark.asyncio
-async def test_update_task(client, db_session: AsyncSession):
+async def test_update_task(client, db: AsyncSession):
+    owner_json = await create_user(client, TEST_USERNAME, TEST_PASSWORD)
+
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
+
+    owner_token = response_json['access_token']
+
+    owner_task_json = await create_task(client, owner_token, TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, owner_json["id"])
+
+    user_json = await create_user(client, "testuser2", "testpass")
+
+    response_json = await get_auth_token(client, "testuser2", "testpass")
+
+    user_token = response_json['access_token']
+
+    await update_task_permissions(client, owner_token, user_json["id"], owner_task_json["id"], can_update=True)
+
     json_data = {
-        "user": {
-            "username": "some username",
-            "password": "123456"
-            # "username": TEST_USERNAME,
-            # "password": TEST_PASSWORD
-        },
-        "task": {
-            "title": "New task title",
-            "description": TEST_TASK_DESCRIPTION,
-        }
+        "title": "New task title",
+        "description": TEST_TASK_DESCRIPTION,
     }
 
-    task_json = await update_task_permissions(client, session=db_session,
-                                              granted_username="some username", granted_password="123456",
-                                              can_update=True)
-
-    response = await client.post(f"/tasks/update/{task_json['id']}", json=json_data)
+    response = await client.post(f"/tasks/update/{owner_task_json['id']}?token={user_token}", json=json_data)
 
     update_task_json = response.json()
 
@@ -298,16 +340,15 @@ async def test_update_task(client, db_session: AsyncSession):
     assert response.status_code == 200
     assert update_task_json["title"] == "New task title"
 
-    task_json = await update_task_permissions(client, need_create_owner_user=False, session=db_session,
-                                              need_create_granted_user=False, can_update=False)
+    await update_task_permissions(client, owner_token, user_json["id"], owner_task_json["id"], can_update=False)
 
-    response = await client.post(f"/tasks/update/{task_json['id']}", json=json_data)
+    response = await client.post(f"/tasks/update/{owner_task_json['id']}?token={user_token}", json=json_data)
 
     # print(response.json())
 
     assert response.status_code == 403
 
-    response = await client.post(f"/tasks/update/{123456}", json=json_data)
+    response = await client.post(f"/tasks/update/{123456}?token={user_token}", json=json_data)
 
     # print(response.json())
 
@@ -315,22 +356,24 @@ async def test_update_task(client, db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_delete_task(client, db_session: AsyncSession):
-    response = await create_task(client)
-    task_json = response.json()
+async def test_delete_task(client, db: AsyncSession):
+    owner_json = await create_user(client, TEST_USERNAME, TEST_PASSWORD)
 
-    json_data = {
-        "username": TEST_USERNAME,
-        "password": TEST_PASSWORD
-    }
+    response_json = await get_auth_token(client, TEST_USERNAME, TEST_PASSWORD)
 
-    response = await client.post(f"/tasks/delete/{task_json['id']}", json=json_data)
+    owner_token = response_json['access_token']
+
+    owner_task_json = await create_task(client, owner_token, TEST_TASK_TITLE, TEST_TASK_DESCRIPTION, owner_json["id"])
+    # print(owner_task_json)
+
+    response = await client.post(f"/tasks/delete/{owner_task_json['id']}?token={owner_token}")
 
     update_task_json = response.json()
+    # print(update_task_json)
 
     assert response.status_code == 200
     assert update_task_json["status"] == "success"
 
-    response = await client.post(f"/tasks/delete/{123456}", json=json_data)
+    response = await client.post(f"/tasks/delete/{123456}?token={owner_token}")
 
     assert response.status_code == 404
